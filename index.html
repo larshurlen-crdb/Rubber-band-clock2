@@ -1,547 +1,358 @@
 <!DOCTYPE html>
+
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Rubber Band Clock</title>
-<!--
-  ╔══════════════════════════════════════════════════════════════╗
-  ║  RUBBER BAND CLOCK                                          ║
-  ║  Version 3.0                                                ║
-  ║                                                             ║
-  ║  v1.0 — Initial concept, 2-pin rubber band                  ║
-  ║  v1.1 — 3-pin triangle band                                 ║
-  ║  v2.0 — Physically correct band geometry (convex hull)      ║
-  ║  v2.1 — Band cast shadow on disc surfaces                   ║
-  ║  v2.2 — Real Oslo time, Samsung TV flicker fix              ║
-  ║  v2.3 — Day/night theme system, URL param switching         ║
-  ║  v3.0 — Auto day/night based on Halden sunrise/sunset       ║
-  ║          3-second crossfade between themes                  ║
-  ║          ?mode=day or ?mode=night to override               ║
-  ╚══════════════════════════════════════════════════════════════╝
--->
+<title>Gravity Clock</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; cursor: none; }
-  html, body {
-    width: 100%; height: 100%;
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
     background: #000;
     display: flex;
-    align-items: center;
     justify-content: center;
+    align-items: center;
+    width: 100vw;
+    height: 100vh;
     overflow: hidden;
   }
   canvas {
     display: block;
-    width: 100vw;
-    height: 56.25vw;
-    max-height: 100vh;
-    max-width: 177.78vh;
+    image-rendering: crisp-edges;
   }
 </style>
 </head>
 <body>
-<canvas id="clock"></canvas>
+<canvas id="c"></canvas>
 <script>
-const canvas = document.getElementById('clock');
-const ctx    = canvas.getContext('2d');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
 
-const W = 1920, H = 1080;
-canvas.width  = W;
+// Internal resolution: 16:9
+const W = 1920;
+const H = 1080;
+canvas.width = W;
 canvas.height = H;
 
-const cx = W / 2, cy = H / 2;
-const OUTER_R     = 390;
-const INNER_R     = 240;
-const PIN_R       = 18;
-const START_ANGLE = -Math.PI / 2;
+function resize() {
+const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+canvas.style.width  = (W * scale) + ‘px’;
+canvas.style.height = (H * scale) + ‘px’;
+}
+resize();
+window.addEventListener(‘resize’, resize);
 
-// ─── URL override: ?mode=day or ?mode=night, ?demo to fast-forward ───────────
-const urlMode = new URLSearchParams(window.location.search).get('mode');
-const demoMode = new URLSearchParams(window.location.search).has('demo');
-// Demo: one full day in ~30 seconds (2880x speed)
-const DEMO_SPEED = 2880;
-const demoStart = Date.now();
+// ─── Layout ───────────────────────────────────────────────────────────────────
+const CX = W / 2;
+const CY = H / 2;
+const DISK_R = 470;
 
-// ─── SUNRISE / SUNSET  (Halden, Norway: 59.13°N, 11.39°E) ───────────────────
-// Returns { sunrise, sunset } as decimal hours in local Oslo time.
-// Uses the standard NOAA/Meeus astronomical algorithm.
+// ─── Colours ──────────────────────────────────────────────────────────────────
+const COL_BG   = ‘#F06BCC’;   // vivid pink
+const COL_DISK = ‘#0A0A0A’;   // near-black
+const COL_NUM  = ‘#FFFFFF’;
+const COL_HAND = ‘#EE1A1A’;   // red
+const COL_SEC  = ‘#1A3EEE’;   // blue
+const COL_DOT  = ‘#1A3EEE’;
 
-function getSunTimes(date) {
-  const lat  = 59.13;
-  const lng  = 11.39;
+// ─── Physics constants ────────────────────────────────────────────────────────
+const GRAVITY         = 0.7;
+const FRICTION        = 0.82;   // heavy drag
+const ANGULAR_DAMP    = 0.55;   // spin dies in a few frames
+const BOUNCE          = 0.05;   // almost no rebound
+const NUM_RADIUS      = 46;
+const ARM_PUSH_ARC    = 0.20;
+const ARM_PUSH_FORCE  = 10;
+const FONT_SIZE       = 88;
+const SLEEP_V         = 0.4;    // below this speed → freeze
+const SLEEP_A         = 0.008;  // below this angVel → freeze rotation
 
-  const rad = Math.PI / 180;
-  const deg = 180 / Math.PI;
-
-  // Julian date
-  const JD = (date.getTime() / 86400000) + 2440587.5;
-
-  // Julian century
-  const n  = JD - 2451545.0;
-  const L  = (280.460 + 0.9856474 * n) % 360;
-  const g  = (357.528 + 0.9856003 * n) % 360;
-  const lam = L + 1.915 * Math.sin(g * rad) + 0.020 * Math.sin(2 * g * rad);
-  const eps = 23.439 - 0.0000004 * n;
-  const sinDec = Math.sin(eps * rad) * Math.sin(lam * rad);
-  const dec    = Math.asin(sinDec) * deg;
-
-  // Hour angle for sunrise/sunset (centre of sun on horizon)
-  const cosHA = (Math.cos(90.833 * rad) - Math.sin(lat * rad) * Math.sin(dec * rad))
-              / (Math.cos(lat * rad) * Math.cos(dec * rad));
-
-  if (cosHA < -1) return { sunrise: 0,  sunset: 24 }; // midnight sun
-  if (cosHA >  1) return { sunrise: 12, sunset: 12 }; // polar night
-
-  const HA = Math.acos(cosHA) * deg; // degrees
-
-  // Equation of time (minutes)
-  const f   = (279.575 + 0.9856474 * n) % 360;
-  const EqT = (-104.5 * Math.sin(f * rad) - 596.9 * Math.sin(2 * g * rad)
-               + 4.1   * Math.sin(3 * f * rad) + 0.5 * Math.cos(f * rad)
-               - 12.79 * Math.cos(2 * f * rad) - 429.3 * Math.cos(2 * g * rad)
-               - 2     * Math.cos(3 * f * rad)) / 3600; // hours
-
-  // UTC offset for Oslo (standard: +1, summer CEST: +2)
-  // Derive from the Date object itself
-  const osloNow = new Date(date.toLocaleString('en-US', { timeZone: 'Europe/Oslo' }));
-  const utcOffset = (osloNow - new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }))) / 3600000;
-
-  const noon    = 12 - (lng / 15) - EqT + utcOffset;
-  const sunrise = noon - HA / 15;
-  const sunset  = noon + HA / 15;
-
-  return { sunrise, sunset };
+// ─── Numbers ──────────────────────────────────────────────────────────────────
+function makePile() {
+// Drop numbers into a central bottom cluster so they settle naturally
+const nums = [];
+for (let i = 1; i <= 12; i++) {
+// Stagger positions in a tight cluster at the bottom of the disk
+const col = (i - 1) % 4;
+const row = Math.floor((i - 1) / 4);
+nums.push({
+label: String(i),
+x: CX + (col - 1.5) * (NUM_RADIUS * 2.1) + (Math.random() - 0.5) * 20,
+y: CY + DISK_R * 0.55 + row * (NUM_RADIUS * 2.1) + (Math.random() - 0.5) * 20,
+vx: 0,
+vy: 0,
+angle: (Math.random() - 0.5) * 0.4,
+angVel: 0,
+r: NUM_RADIUS,
+sleeping: false,
+});
+}
+return nums;
 }
 
-// Returns 0 = fully day, 1 = fully night, intermediate during crossfade
-// Crossfade duration: 3 seconds expressed as a fraction of an hour
-const CROSSFADE_HOURS = 3 / 3600;
-const OFFSET_HOURS    = 0.5; // 30 minutes
+const numbers = makePile();
 
-function getDayNightBlend(osloDate) {
-  const now = osloDate.getHours() + osloDate.getMinutes() / 60 + osloDate.getSeconds() / 3600;
-  const { sunrise, sunset } = getSunTimes(osloDate);
+// ─── Clock angles ─────────────────────────────────────────────────────────────
+function clockAngles() {
+const now  = new Date();
+const h    = now.getHours() % 12;
+const m    = now.getMinutes();
+const s    = now.getSeconds();
+const ms   = now.getMilliseconds();
+const base = -Math.PI / 2;
 
-  // Day mode: sunrise - 30min  →  sunset + 30min
-  const dayStart = sunrise - OFFSET_HOURS;
-  const dayEnd   = sunset  + OFFSET_HOURS;
-
-  // Before dawn crossfade start → fully night
-  if (now < dayStart - CROSSFADE_HOURS) return 1;
-  // Dawn crossfade: night → day
-  if (now < dayStart) return 1 - (now - (dayStart - CROSSFADE_HOURS)) / CROSSFADE_HOURS;
-  // Full day
-  if (now < dayEnd) return 0;
-  // Dusk crossfade: day → night
-  if (now < dayEnd + CROSSFADE_HOURS) return (now - dayEnd) / CROSSFADE_HOURS;
-  // After dusk crossfade → fully night
-  return 1;
+const sec = base + ((s + ms / 1000) / 60) * Math.PI * 2;
+const min = base + ((m + s / 60)   / 60) * Math.PI * 2;
+const hr  = base + ((h + m / 60)   / 12) * Math.PI * 2;
+return { sec, min, hr };
 }
 
-// ─── THEMES ──────────────────────────────────────────────────────────────────
-
-const THEMES = {
-  night: {
-    panelColor:    '#22252c',
-    vignetteColor: 'rgba(0,0,0,0.5)',
-    shadowOffsetX: 0.5, shadowOffsetY: 0.85,
-    shadowFalloff: 1.2, shadowSharpness: 0.2,
-    shadowInner:  'rgba(0,0,0,0.6)',
-    shadowMid:    'rgba(0,0,0,0.25)',
-    discGradientType: 'radial',
-    discLit:    '#3e434d', discMid: '#2e3238', discShadow: '#181b20',
-    discEdgeDark: 'rgba(0,0,0,0.5)', discEdgeStart: 0.7,
-    discHaloColor: 'rgba(0,0,0,0.35)',
-    discRimLight: null, discRimShadow: null,
-    innerOnOuterShadow: 'rgba(0,0,0,0.22)',
-    axleLit: '#4a4e58', axleMid: '#2a2d35', axleDark: '#14161a',
-    bandShadow1: 'rgba(0,0,0,0.12)', bandShadow2: 'rgba(0,0,0,0.20)', bandShadow3: 'rgba(0,0,0,0.22)',
-    band0: '#7a3a08', band25: '#c45e10', band50: '#b84e0c', band75: '#d4660e', band100: '#8a3a08',
-    bandHighlight: 'rgba(255,180,120,0.18)', bandShadowStroke: 'rgba(0,0,0,0.30)',
-    pinLit: '#e8c84a', pinMid: '#b88a18', pinDark: '#5a3c06',
-    pinHighlight: 'rgba(255,245,190,0.35)', pinEdgeDark: 'rgba(0,0,0,0.4)',
-    wallShadow: null, wallShadowMid: null,
-  },
-
-  day: {
-    panelColor:    '#c4bfb8',
-    vignetteColor: 'rgba(30,22,15,0.08)',
-    shadowOffsetX: 0.7, shadowOffsetY: 0.8,
-    shadowFalloff: 0.9, shadowSharpness: 0.3,
-    shadowInner: 'rgba(50,42,35,0.40)', shadowMid: 'rgba(50,42,35,0.15)',
-    discGradientType: 'linear',
-    discLit: '#ddd8d0', discMid: '#ccc6bc', discShadow: '#b0a89e',
-    discEdgeDark: 'rgba(40,32,25,0.28)', discEdgeStart: 0.68,
-    discHaloColor: 'rgba(40,32,25,0.18)',
-    discRimLight: 'rgba(255,252,245,0.7)', discRimShadow: 'rgba(30,24,18,0.25)',
-    innerOnOuterShadow: 'rgba(50,42,35,0.16)',
-    axleLit: '#b8b0a6', axleMid: '#989088', axleDark: '#706860',
-    bandShadow1: 'rgba(50,35,20,0.10)', bandShadow2: 'rgba(50,35,20,0.18)', bandShadow3: 'rgba(50,35,20,0.24)',
-    band0: '#8a3a06', band25: '#d46010', band50: '#c05010', band75: '#e06818', band100: '#923808',
-    bandHighlight: 'rgba(255,200,150,0.20)', bandShadowStroke: 'rgba(40,18,0,0.22)',
-    pinLit: '#f0d050', pinMid: '#c09020', pinDark: '#6a4808',
-    pinHighlight: 'rgba(255,252,200,0.55)', pinEdgeDark: 'rgba(70,45,0,0.38)',
-    wallShadow: 'rgba(15,10,5,0.30)', wallShadowMid: 'rgba(15,10,5,0.10)',
-  }
-};
-
-// ─── COLOR INTERPOLATION ──────────────────────────────────────────────────────
-
-function parseColor(str) {
-  str = str.trim();
-  // rgba(r,g,b,a)
-  let m = str.match(/rgba?\(([^)]+)\)/);
-  if (m) {
-    const parts = m[1].split(',').map(Number);
-    return [parts[0], parts[1], parts[2], parts[3] !== undefined ? parts[3] : 1];
-  }
-  // #rrggbb
-  m = str.match(/^#([0-9a-f]{6})$/i);
-  if (m) {
-    const v = parseInt(m[1], 16);
-    return [(v>>16)&255, (v>>8)&255, v&255, 1];
-  }
-  return [0,0,0,1];
+// ─── Physics ──────────────────────────────────────────────────────────────────
+function angularDiff(a, b) {
+let d = a - b;
+while (d >  Math.PI) d -= Math.PI * 2;
+while (d < -Math.PI) d += Math.PI * 2;
+return d;
 }
 
-function lerpColor(a, b, t) {
-  const ca = parseColor(a), cb = parseColor(b);
-  const r = ca[0] + (cb[0]-ca[0])*t;
-  const g = ca[1] + (cb[1]-ca[1])*t;
-  const bl= ca[2] + (cb[2]-ca[2])*t;
-  const al= ca[3] + (cb[3]-ca[3])*t;
-  if (al >= 0.99) return `rgb(${Math.round(r)},${Math.round(g)},${Math.round(bl)})`;
-  return `rgba(${Math.round(r)},${Math.round(g)},${Math.round(bl)},${al.toFixed(3)})`;
+function applySweep(secAngle, dAngle) {
+if (Math.abs(dAngle) < 0.00005) return;
+for (const n of numbers) {
+const dx   = n.x - CX;
+const dy   = n.y - CY;
+const dist = Math.hypot(dx, dy);
+if (dist < 10) continue;
+
+```
+const numAngle = Math.atan2(dy, dx);
+const diff     = angularDiff(numAngle, secAngle);
+
+// Number is "just behind" the sweeping arm (within push arc)
+if (diff > -ARM_PUSH_ARC && diff < ARM_PUSH_ARC * 0.3) {
+  // Tangential direction of clockwise sweep
+  const tx = -dy / dist;
+  const ty =  dx / dist;
+  // Strength scales with how close to dead-on and how far from centre
+  const proximity = 1 - Math.abs(diff) / ARM_PUSH_ARC;
+  const leverage  = dist / DISK_R;
+  const force     = ARM_PUSH_FORCE * proximity * (0.4 + leverage * 0.8);
+  n.vx    += tx * force;
+  n.vy    += ty * force;
+  n.angVel += dAngle * 0.5 * proximity;
+  n.sleeping = false;  // wake it up
+}
+```
+
+}
 }
 
-// Blend two theme objects, t=0 → day, t=1 → night
-function blendThemes(t) {
-  const d = THEMES.day, n = THEMES.night;
-  const B = {};
+function resolveNumberCollisions() {
+const len = numbers.length;
+for (let i = 0; i < len; i++) {
+for (let j = i + 1; j < len; j++) {
+const a  = numbers[i];
+const b  = numbers[j];
+const dx = b.x - a.x;
+const dy = b.y - a.y;
+const d  = Math.hypot(dx, dy);
+const minD = a.r + b.r;
+if (d >= minD || d < 0.01) continue;
 
-  // Numeric values — linear interpolation
-  B.shadowOffsetX   = d.shadowOffsetX   + (n.shadowOffsetX   - d.shadowOffsetX)   * t;
-  B.shadowOffsetY   = d.shadowOffsetY   + (n.shadowOffsetY   - d.shadowOffsetY)   * t;
-  B.shadowFalloff   = d.shadowFalloff   + (n.shadowFalloff   - d.shadowFalloff)   * t;
-  B.shadowSharpness = d.shadowSharpness + (n.shadowSharpness - d.shadowSharpness) * t;
-  B.discEdgeStart   = d.discEdgeStart   + (n.discEdgeStart   - d.discEdgeStart)   * t;
+```
+  const nx  = dx / d;
+  const ny  = dy / d;
+  const ov  = (minD - d) * 0.5;
+  a.x -= nx * ov;
+  a.y -= ny * ov;
+  b.x += nx * ov;
+  b.y += ny * ov;
 
-  // Gradient type — snap at midpoint
-  B.discGradientType = t < 0.5 ? d.discGradientType : n.discGradientType;
+  const dvx = b.vx - a.vx;
+  const dvy = b.vy - a.vy;
+  const dot = dvx * nx + dvy * ny;
+  if (dot >= 0) continue;
 
-  // Rim — null means not drawn; blend in/out via alpha effectively by nulling
-  B.discRimLight  = t < 0.5 ? d.discRimLight  : null;
-  B.discRimShadow = t < 0.5 ? d.discRimShadow : null;
+  const imp = dot * (1 + BOUNCE) * 0.5;
+  a.vx += nx * imp; a.sleeping = false;
+  a.vy += ny * imp;
+  b.vx -= nx * imp; b.sleeping = false;
+  b.vy -= ny * imp;
 
-  // All color strings
-  const colorKeys = [
-    'panelColor','vignetteColor',
-    'shadowInner','shadowMid',
-    'discLit','discMid','discShadow','discEdgeDark','discHaloColor',
-    'innerOnOuterShadow',
-    'axleLit','axleMid','axleDark',
-    'bandShadow1','bandShadow2','bandShadow3',
-    'band0','band25','band50','band75','band100',
-    'bandHighlight','bandShadowStroke',
-    'pinLit','pinMid','pinDark','pinHighlight','pinEdgeDark',
-  ];
-  for (const k of colorKeys) {
-    B[k] = lerpColor(d[k], n[k], t);
-  }
+  const cross = dvx * ny - dvy * nx;
+  a.angVel += cross * 0.006;
+  b.angVel -= cross * 0.006;
+}
+```
 
-  // Wall shadow — lerp or null
-  B.wallShadow    = d.wallShadow    ? lerpColor(d.wallShadow,    'rgba(0,0,0,0)', t) : null;
-  B.wallShadowMid = d.wallShadowMid ? lerpColor(d.wallShadowMid, 'rgba(0,0,0,0)', t) : null;
-
-  return B;
+}
 }
 
-// Active theme — updated each frame
-let T = THEMES.day;
+function resolveWalls() {
+for (const n of numbers) {
+const dx   = n.x - CX;
+const dy   = n.y - CY;
+const dist = Math.hypot(dx, dy);
+const maxD = DISK_R - n.r;
+if (dist <= maxD || dist < 0.01) continue;
 
-// ─── TIME ────────────────────────────────────────────────────────────────────
+```
+const nx = dx / dist;
+const ny = dy / dist;
+n.x  = CX + nx * maxD;
+n.y  = CY + ny * maxD;
 
-function getOsloDate() {
-  const now = new Date();
-  if (demoMode) {
-    // Start at midnight and fast-forward through a full day
-    const elapsed = (Date.now() - demoStart) * DEMO_SPEED;
-    const midnight = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Oslo' }));
-    midnight.setHours(0, 0, 0, 0);
-    return new Date(midnight.getTime() + elapsed);
-  }
-  return new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Oslo' }));
+const dot = n.vx * nx + n.vy * ny;
+if (dot > 0) {
+  n.vx -= (1 + BOUNCE) * dot * nx;
+  n.vy -= (1 + BOUNCE) * dot * ny;
+  n.angVel *= BOUNCE;
+}
+```
+
+}
 }
 
-function getAngles(oslo) {
-  const hours   = oslo.getHours() % 12;
-  const minutes = oslo.getMinutes();
-  const seconds = oslo.getSeconds();
-  const ms      = oslo.getMilliseconds();
-  return {
-    outerAngle: ((minutes + seconds/60 + ms/60000) / 60)    * Math.PI * 2,
-    innerAngle: ((hours*3600 + minutes*60 + seconds + ms/1000) / 43200) * Math.PI * 2,
-  };
+function stepPhysics(secAngle, dAngle) {
+// Wake numbers that the arm is about to push
+applySweep(secAngle, dAngle);
+
+for (const n of numbers) {
+if (n.sleeping) continue;
+
+```
+n.vy     += GRAVITY;
+n.vx     *= FRICTION;
+n.vy     *= FRICTION;
+n.x      += n.vx;
+n.y      += n.vy;
+n.angle  += n.angVel;
+n.angVel *= ANGULAR_DAMP;
+
+// Hard-clamp tiny residual spin to zero
+if (Math.abs(n.angVel) < SLEEP_A) n.angVel = 0;
+
+// Sleep check
+const speed = Math.hypot(n.vx, n.vy);
+if (speed < SLEEP_V && Math.abs(n.angVel) === 0) {
+  n.vx = 0; n.vy = 0;
+  n.sleeping = true;
+}
+```
+
 }
 
-// ─── DRAWING FUNCTIONS ────────────────────────────────────────────────────────
-
-function drawBackground() {
-  ctx.fillStyle = T.panelColor;
-  ctx.fillRect(0, 0, W, H);
-  const vig = ctx.createRadialGradient(cx, cy, H*0.15, cx, cy, H*0.82);
-  vig.addColorStop(0, 'rgba(0,0,0,0)');
-  vig.addColorStop(1, T.vignetteColor);
-  ctx.fillStyle = vig;
-  ctx.fillRect(0, 0, W, H);
-
-  if (T.wallShadow) {
-    const wx = cx + OUTER_R * 0.55;
-    const wy = cy + OUTER_R * 0.60;
-    const wg = ctx.createRadialGradient(wx, wy, 0, wx, wy, OUTER_R * 0.75);
-    wg.addColorStop(0,   T.wallShadow);
-    wg.addColorStop(0.5, T.wallShadowMid);
-    wg.addColorStop(1,   'rgba(0,0,0,0)');
-    ctx.fillStyle = wg;
-    ctx.fillRect(0, 0, W, H);
-  }
+for (let iter = 0; iter < 2; iter++) {
+resolveNumberCollisions();
+resolveWalls();
+}
 }
 
-function drawCastShadow(x, y, r, elevation) {
-  const ox     = elevation * T.shadowOffsetX;
-  const oy     = elevation * T.shadowOffsetY;
-  const spread = r + elevation * T.shadowFalloff;
-  const sg = ctx.createRadialGradient(x+ox, y+oy, r*T.shadowSharpness, x+ox, y+oy, spread);
-  sg.addColorStop(0,   T.shadowInner);
-  sg.addColorStop(0.4, T.shadowMid);
-  sg.addColorStop(1,   'rgba(0,0,0,0)');
-  ctx.beginPath();
-  ctx.arc(x+ox, y+oy, spread, 0, Math.PI*2);
-  ctx.fillStyle = sg;
-  ctx.fill();
+// ─── Drawing helpers ──────────────────────────────────────────────────────────
+function drawHand(angle, length, backLen, width, color) {
+ctx.save();
+ctx.translate(CX, CY);
+ctx.rotate(angle);
+ctx.strokeStyle = color;
+ctx.lineWidth   = width;
+ctx.lineCap     = ‘round’;
+ctx.beginPath();
+ctx.moveTo(-backLen, 0);
+ctx.lineTo(length, 0);
+ctx.stroke();
+ctx.restore();
 }
 
-function drawDisc(x, y, r, elevation) {
-  drawCastShadow(x, y, r, elevation);
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI*2);
-  ctx.clip();
+// Pre-warm font so first frame isn’t a flash
+ctx.font = `${FONT_SIZE}px Anton, sans-serif`;
+ctx.fillText(’’, 0, 0);
 
-  if (T.discGradientType === 'linear') {
-    const base = ctx.createLinearGradient(x-r*0.7, y-r*0.7, x+r*0.7, y+r*0.7);
-    base.addColorStop(0,    T.discLit);
-    base.addColorStop(0.45, T.discMid);
-    base.addColorStop(1,    T.discShadow);
-    ctx.fillStyle = base;
-    ctx.fillRect(x-r, y-r, r*2, r*2);
-  } else {
-    const base = ctx.createRadialGradient(x-r*0.45, y-r*0.45, r*0.05, x+r*0.1, y+r*0.1, r*1.4);
-    base.addColorStop(0,   T.discLit);
-    base.addColorStop(0.4, T.discMid);
-    base.addColorStop(1,   T.discShadow);
-    ctx.fillStyle = base;
-    ctx.fillRect(x-r, y-r, r*2, r*2);
-  }
+// ─── Main loop ────────────────────────────────────────────────────────────────
+const FPS      = 30;
+const FRAME_MS = 1000 / FPS;
+let lastTime   = 0;
+let prevSec    = null;
 
-  const edgeDark = ctx.createRadialGradient(x, y, r*T.discEdgeStart, x, y, r);
-  edgeDark.addColorStop(0, 'rgba(0,0,0,0)');
-  edgeDark.addColorStop(1, T.discEdgeDark);
-  ctx.fillStyle = edgeDark;
-  ctx.fillRect(x-r, y-r, r*2, r*2);
-  ctx.restore();
+function loop(ts) {
+requestAnimationFrame(loop);
+if (ts - lastTime < FRAME_MS) return;
+lastTime = ts;
 
-  const halo = ctx.createRadialGradient(x, y, r-6, x, y, r+5);
-  halo.addColorStop(0,   'rgba(0,0,0,0)');
-  halo.addColorStop(0.5, T.discHaloColor);
-  halo.addColorStop(1,   'rgba(0,0,0,0)');
-  ctx.beginPath();
-  ctx.arc(x, y, r+5, 0, Math.PI*2);
-  ctx.fillStyle = halo;
-  ctx.fill();
+const { sec, min, hr } = clockAngles();
 
-  if (T.discRimLight) {
-    ctx.beginPath();
-    ctx.arc(x, y, r-1, Math.PI*0.8, Math.PI*1.9);
-    ctx.strokeStyle = T.discRimLight;
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(x, y, r-1, Math.PI*-0.15, Math.PI*0.85);
-    ctx.strokeStyle = T.discRimShadow;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-  }
+let dAngle = 0;
+if (prevSec !== null) {
+dAngle = angularDiff(sec, prevSec);
+}
+prevSec = sec;
+
+stepPhysics(sec, dAngle);
+
+// ── Render ──────────────────────────────────────────────────────────────────
+
+// 1. Pink background (overdraw – no clearRect)
+ctx.fillStyle = COL_BG;
+ctx.fillRect(0, 0, W, H);
+
+// 2. Black disk
+ctx.beginPath();
+ctx.arc(CX, CY, DISK_R, 0, Math.PI * 2);
+ctx.fillStyle = COL_DISK;
+ctx.fill();
+
+// 3. Subtle disk rim
+ctx.beginPath();
+ctx.arc(CX, CY, DISK_R, 0, Math.PI * 2);
+ctx.strokeStyle = ‘rgba(255,255,255,0.06)’;
+ctx.lineWidth = 2;
+ctx.stroke();
+
+// 4. Numbers (physics layer)
+ctx.font         = `${FONT_SIZE}px Anton, sans-serif`;
+ctx.textAlign    = ‘center’;
+ctx.textBaseline = ‘middle’;
+
+for (const n of numbers) {
+ctx.save();
+ctx.translate(n.x, n.y);
+ctx.rotate(n.angle);
+// Soft shadow for depth
+ctx.shadowColor   = ‘rgba(0,0,0,0.6)’;
+ctx.shadowBlur    = 8;
+ctx.shadowOffsetX = 3;
+ctx.shadowOffsetY = 3;
+ctx.fillStyle = COL_NUM;
+ctx.fillText(n.label, 0, 0);
+ctx.restore();
 }
 
-function drawInnerOnOuterShadow() {
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, OUTER_R, 0, Math.PI*2, false);
-  ctx.arc(cx, cy, INNER_R, 0, Math.PI*2, true);
-  ctx.clip();
-  const sg = ctx.createRadialGradient(cx+8, cy+12, INNER_R*0.75, cx+8, cy+12, INNER_R+35);
-  sg.addColorStop(0,   'rgba(0,0,0,0)');
-  sg.addColorStop(0.6, T.innerOnOuterShadow);
-  sg.addColorStop(1,   'rgba(0,0,0,0)');
-  ctx.fillStyle = sg;
-  ctx.beginPath();
-  ctx.arc(cx+8, cy+12, INNER_R+35, 0, Math.PI*2);
-  ctx.fill();
-  ctx.restore();
+// Reset shadow before hands
+ctx.shadowColor = ‘transparent’;
+ctx.shadowBlur  = 0;
+
+// 5. Hour hand (red, short, thick)
+drawHand(hr, DISK_R * 0.48, DISK_R * 0.12, 14, COL_HAND);
+
+// 6. Minute hand (red, long, medium)
+drawHand(min, DISK_R * 0.75, DISK_R * 0.12, 9, COL_HAND);
+
+// 7. Seconds hand (blue, longest, thin)
+drawHand(sec, DISK_R * 0.88, DISK_R * 0.18, 5, COL_SEC);
+
+// 8. Centre pivot
+ctx.beginPath();
+ctx.arc(CX, CY, 16, 0, Math.PI * 2);
+ctx.fillStyle = COL_DOT;
+ctx.fill();
+ctx.beginPath();
+ctx.arc(CX, CY, 7, 0, Math.PI * 2);
+ctx.fillStyle = ‘#fff’;
+ctx.fill();
 }
 
-function drawAxle() {
-  const r = 22;
-  drawCastShadow(cx, cy, r, 8);
-  const g = ctx.createRadialGradient(cx-r*0.35, cy-r*0.35, 1, cx, cy, r);
-  g.addColorStop(0,   T.axleLit);
-  g.addColorStop(0.6, T.axleMid);
-  g.addColorStop(1,   T.axleDark);
-  ctx.beginPath();
-  ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.fillStyle = g;
-  ctx.fill();
-  const halo = ctx.createRadialGradient(cx, cy, r-4, cx, cy, r+3);
-  halo.addColorStop(0, 'rgba(0,0,0,0)');
-  halo.addColorStop(1, T.discHaloColor);
-  ctx.beginPath();
-  ctx.arc(cx, cy, r+3, 0, Math.PI*2);
-  ctx.fillStyle = halo;
-  ctx.fill();
-}
-
-function buildBandPath(pins, offsetX, offsetY) {
-  const ox = offsetX || 0, oy = offsetY || 0;
-  const n = pins.length, r = pins[0].r;
-  let gcx = 0, gcy = 0;
-  for (const p of pins) { gcx += p.x; gcy += p.y; }
-  gcx /= n; gcy /= n;
-  const sorted = [...pins].sort((a,b) =>
-    Math.atan2(a.y-gcy, a.x-gcx) - Math.atan2(b.y-gcy, b.x-gcx)
-  );
-  const dep = [], arr = [];
-  for (let i = 0; i < n; i++) {
-    const j = (i+1)%n;
-    const pi = sorted[i], pj = sorted[j];
-    const dx = pj.x-pi.x, dy = pj.y-pi.y;
-    const len = Math.sqrt(dx*dx+dy*dy);
-    if (len < 0.001) { dep[i]={x:pi.x+ox,y:pi.y+oy}; arr[i]={x:pj.x+ox,y:pj.y+oy}; continue; }
-    const nx = dy/len, ny = -dx/len;
-    dep[i] = {x:pi.x+r*nx+ox, y:pi.y+r*ny+oy};
-    arr[i] = {x:pj.x+r*nx+ox, y:pj.y+r*ny+oy};
-  }
-  ctx.beginPath();
-  for (let i = 0; i < n; i++) {
-    const prev = (i-1+n)%n;
-    const pin  = sorted[i];
-    const arrPt = arr[prev], depPt = dep[i];
-    const sa = Math.atan2(arrPt.y-(pin.y+oy), arrPt.x-(pin.x+ox));
-    const ea = Math.atan2(depPt.y-(pin.y+oy), depPt.x-(pin.x+ox));
-    if (i===0) ctx.moveTo(arrPt.x, arrPt.y);
-    ctx.arc(pin.x+ox, pin.y+oy, r, sa, ea, false);
-    ctx.lineTo(arr[i].x, arr[i].y);
-  }
-  ctx.closePath();
-}
-
-function drawBandShadow(pins) {
-  const sx = 8, sy = 10;
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, OUTER_R, 0, Math.PI*2, false);
-  ctx.arc(cx, cy, INNER_R, 0, Math.PI*2, true);
-  ctx.clip();
-  buildBandPath(pins, sx*2.2, sy*2.2);
-  ctx.lineWidth=22; ctx.strokeStyle=T.bandShadow1; ctx.lineJoin='round'; ctx.lineCap='round'; ctx.stroke();
-  buildBandPath(pins, sx*1.5, sy*1.5);
-  ctx.lineWidth=13; ctx.strokeStyle=T.bandShadow2; ctx.lineJoin='round'; ctx.lineCap='round'; ctx.stroke();
-  buildBandPath(pins, sx, sy);
-  ctx.lineWidth=7;  ctx.strokeStyle=T.bandShadow3; ctx.lineJoin='round'; ctx.lineCap='round'; ctx.stroke();
-  ctx.restore();
-}
-
-function drawRubberBand(pins) {
-  const xs = pins.map(p=>p.x), ys = pins.map(p=>p.y);
-  const grad = ctx.createLinearGradient(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
-  grad.addColorStop(0,    T.band0);
-  grad.addColorStop(0.25, T.band25);
-  grad.addColorStop(0.5,  T.band50);
-  grad.addColorStop(0.75, T.band75);
-  grad.addColorStop(1,    T.band100);
-  ctx.save();
-  buildBandPath(pins);
-  ctx.lineWidth=15; ctx.strokeStyle=T.bandShadowStroke; ctx.lineJoin='round'; ctx.stroke();
-  buildBandPath(pins);
-  ctx.lineWidth=9;  ctx.strokeStyle=grad; ctx.lineJoin='round'; ctx.stroke();
-  buildBandPath(pins);
-  ctx.lineWidth=2;  ctx.strokeStyle=T.bandHighlight; ctx.stroke();
-  ctx.restore();
-}
-
-function drawPin(x, y, r) {
-  drawCastShadow(x, y, r, 10);
-  const g = ctx.createRadialGradient(x-r*0.38, y-r*0.4, r*0.04, x+r*0.1, y+r*0.1, r*1.1);
-  g.addColorStop(0, T.pinLit); g.addColorStop(0.5, T.pinMid); g.addColorStop(1, T.pinDark);
-  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fillStyle=g; ctx.fill();
-  const edge = ctx.createRadialGradient(x, y, r*0.6, x, y, r);
-  edge.addColorStop(0, 'rgba(0,0,0,0)'); edge.addColorStop(1, T.pinEdgeDark);
-  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fillStyle=edge; ctx.fill();
-  ctx.beginPath(); ctx.arc(x-r*0.28, y-r*0.3, r*0.32, 0, Math.PI*2);
-  ctx.fillStyle=T.pinHighlight; ctx.fill();
-}
-
-// ─── RENDER LOOP ──────────────────────────────────────────────────────────────
-
-const TARGET_FPS = 30;
-const FRAME_MS   = 1000 / TARGET_FPS;
-let lastFrame    = 0;
-
-function draw(timestamp) {
-  requestAnimationFrame(draw);
-  if (timestamp - lastFrame < FRAME_MS) return;
-  lastFrame = timestamp;
-
-  // Update theme blend
-  const oslo = getOsloDate();
-
-  let blend;
-  if      (urlMode === 'day')   blend = 0;
-  else if (urlMode === 'night') blend = 1;
-  else                          blend = getDayNightBlend(oslo);
-
-  T = blend <= 0 ? THEMES.day
-    : blend >= 1 ? THEMES.night
-    : blendThemes(blend);
-
-  const { outerAngle, innerAngle } = getAngles(oslo);
-
-  drawBackground();
-  drawDisc(cx, cy, OUTER_R, 14);
-  drawInnerOnOuterShadow();
-  drawDisc(cx, cy, INNER_R, 22);
-  drawAxle();
-
-  const pins = [
-    { x: cx, y: cy, r: PIN_R },
-    {
-      x: cx + Math.cos(START_ANGLE + innerAngle) * (INNER_R * 0.65),
-      y: cy + Math.sin(START_ANGLE + innerAngle) * (INNER_R * 0.65),
-      r: PIN_R
-    },
-    {
-      x: cx + Math.cos(START_ANGLE + outerAngle) * (OUTER_R * 0.72),
-      y: cy + Math.sin(START_ANGLE + outerAngle) * (OUTER_R * 0.72),
-      r: PIN_R
-    }
-  ];
-
-  drawBandShadow(pins);
-  drawRubberBand(pins);
-  pins.forEach(p => drawPin(p.x, p.y, p.r));
-}
-
-requestAnimationFrame(draw);
+requestAnimationFrame(loop);
 </script>
+
 </body>
 </html>
